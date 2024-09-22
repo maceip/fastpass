@@ -1,6 +1,9 @@
-# fastpass: a performant mpc endpoint
 
-forked from: https://github.com/junkurihara/rust-rpxy
+# fastpass: a performant mpc endpoint
+<img src="https://github.com/user-attachments/assets/4c4d25ce-fcc5-4c5f-ae8c-49d7002e7978" width="230" />
+<sup>forked from: https://github.com/junkurihara/rust-rpxy</sup>
+
+showcasing tlsnotary and other magical protocls -- at wire speed
 
 
 ```bash
