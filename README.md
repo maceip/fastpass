@@ -14,3 +14,4 @@ showcasing tlsnotary and other magical protocls -- at wire speed
 
 % cd docker && docker compose up
 ```
+![sa](https://github.com/user-attachments/assets/3f7c0b21-8578-40a3-a640-276f228714f5)
