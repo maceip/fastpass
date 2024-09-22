@@ -1,0 +1,95 @@
+########################################
+#                                      #
+#       rust-rxpy configuration        #
+#                                      #
+########################################
+###################################
+#         Global settings         #
+###################################
+# Both or either one of http/https ports must be specified
+listen_port_tls = 443
+
+# Optional. If you listen on a custom port like 8443 but redirect with firewall to 443
+# When you specify this, the server sends a redirection response 301 with specified port to the client for plaintext http request.
+# Otherwise, the server sends 301 with the same port as `listen_port_tls`.
+# https_redirection_port = 443
+
+# Optional for h2 and http1.1
+tcp_listen_backlog = 1024
+
+# Optional for h2 and http1.1
+max_concurrent_streams = 100
+
+# Optional. Counted in total for http1.1, 2, 3
+max_clients = 512
+
+# Optional: Listen [::]
+listen_ipv6 = false
+
+# Optional: App that serves all plaintext http request by referring to HOSTS or request header
+# execpt for configured application.
+# Note that this is only for http.
+# Note that nothing is served for requests via https since secure channel cannot be
+# established for unconfigured server_name, and they are always rejected by checking SNI.
+default_app = 'tlsnotary'
+
+###################################
+#         Backend settings        #
+###################################
+[apps]
+
+######################################################################
+######################################################################
+
+######################################################################
+# Another application backend servied by different domain name
+[apps.tlsnotary]
+server_name = 'covert.codes'
+
+upstream_options = [
+  "upgrade_insecure_requests",
+  "force_http11_upstream",
+  "set_upstream_host",       
+]
+tls = { https_redirection = true, acme = true }
+reverse_proxy = [{ upstream = [{ location = 'localhost:7047', tls = false }] }]
+######################################################################
+
+######################################################################
+
+###################################
+#      Experimantal settings      #
+###################################
+[experimental]
+# Higly recommend not to be true. If true, you ignore RFC. if not specified, it is always false.
+# This might be required to be true when a certificate is used by multiple backend hosts, especially in case where a TLS connection is re-used.
+# We should note that this strongly depends on the client implementation.
+
+ignore_sni_consistency = false
+# Force connection handling timeout regardless of the connection status, i.e., idle or not.
+# 0 represents an infinite timeout. [default: 0]
+# Note that idel and header read timeouts are always specified independently of this.
+connection_handling_timeout = 0 # sec
+
+# If this specified, h3 is enabled
+[experimental.h3]
+alt_svc_max_age = 3600             # sec
+request_max_body_size = 65536      # bytes
+max_concurrent_connections = 10000
+max_concurrent_bidistream = 100
+max_concurrent_unistream = 100
+max_idle_timeout = 10              # secs. 0 represents an infinite timeout.
+# WARNING: If a peer or its network path malfunctions or acts maliciously, an infinite idle timeout can result in permanently hung futures!
+
+# If this specified, file cache feature is enabled
+  # overwrite HOST value with upstream hostname (like www.yahoo.com)
+[experimental.cache]
+cache_dir = './cache'                # optional. default is "./cache" relative to the current working directory
+max_cache_entry = 1000               # optional. default is 1k
+max_cache_each_size = 65535          # optional. default is 64k
+max_cache_each_size_on_memory = 4096 # optional. default is 4k if 0, it is always file cache.
+
+# ACME settings. Unless specified, ACME is disabled.
+[experimental.acme]
+email = "mac@covert.codes"
+registry_path = "./acme_registry"       # optional. default is "./acme_registry" relative to the current working directory
