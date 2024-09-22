@@ -5,17 +5,13 @@ services:
     init: true
     restart: unless-stopped
     ports:
-      - 127.0.0.1:8080:8080/tcp
-      - 127.0.0.1:8443:8443/udp
-      - 127.0.0.1:8443:8443/tcp
+      - 0.0.0.0:443:443/tcp
+      - 0.0.0.0:443:443/udp
     build: # Uncomment if you build yourself
       context: ../
-      # args: # Uncomment when build quic-s2n version
-      #   - "CARGO_FEATURES=--no-default-features --features=http3-s2n"
-      #   - "ADDITIONAL_DEPS=pkg-config libssl-dev cmake libclang1 gcc g++"
-      # args: # Uncomment when build with webpki root store
-      #   - "CARGO_FEATURES=--no-default-features --features=http3-quinn,webpki-roots"
-      dockerfile: ./docker/Dockerfile # based on ubuntu 22.04 and build x86_64-unknown-linux-gnu
+      args:
+         - "CARGO_FEATURES=--no-default-features --features=http3-quinn,webpki-roots"
+      dockerfile: ./docker/rpxy-Dockerfile # based on ubuntu 22.04 and build x86_64-unknown-linux-gnu
       platforms: # Choose your platforms
         # - "linux/amd64"
         - "linux/arm64"
@@ -32,9 +28,31 @@ services:
       - ./log:/rpxy/log:rw
       - ./cache:/rpxy/cache:rw
       - ./acme_registry:/rpxy/acme_registry:rw
-      - ../example-certs/server.crt:/certs/server.crt:ro
-      - ../example-certs/server.key:/certs/server.key:ro
-      - ../config-example.toml:/etc/rpxy.toml:ro
-      # NOTE: To correctly enable "watch" in docker,
-      # ** you should mount not a file but a dir mapped to /rpxy/config including "rpxy.toml" due to the limitation of docker **
-      # e.g, - ./rpxy-config:/rpxy/config
+      - ../config.toml:/etc/rpxy.toml:ro
+
+  tlsnotary:
+    image: jqtype/rpxy:latest # ghcr.io/junkurihara/rust-rpxy:latest also works
+    container_name: tlsnotary
+    init: true
+    restart: unless-stopped
+    ports:
+      - 127.0.0.1:8080:8080/tcp
+      - 127.0.0.1:8443:8443/udp
+      - 127.0.0.1:8443:8443/tcp
+    build: # Uncomment if you build yourself
+      context: ../submodules/tlsn
+      args:
+          - "CARGO_FEATURES=--features=tee_quote"
+      dockerfile: ./docker/tlsnotary-Dockerfile # based on ubuntu 22.04 and build x86_64-unknown-linux-gnu
+      platforms: # Choose your platforms
+         - "linux/amd64"
+    environment:
+      - LOG_LEVEL=debug
+    tty: false
+    privileged: false
+    volumes:
+      - ./log:/rpxy/log:rw
+      - ./cache:/rpxy/cache:rw
+      - ./acme_registry:/rpxy/acme_registry:rw
+      - ../submodules/tlsn/crates/notary/server/config:/workspace:ro
+      - ../submodules/tlsn/crates/notary/server/fixture:/workspace:ro
