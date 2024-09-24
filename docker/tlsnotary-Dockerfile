@@ -1,39 +1,34 @@
-FROM lukemathwalker/cargo-chef:latest-rust-1.81 as chef
+FROM alpine:latest as build
 
-ARG FEAT
-ENV FEAT=$FEAT
-WORKDIR /build
+RUN apk update && apk add --no-cache \
+        cmake clang-dev openssl-dev openssl-libs-static curl 
 
-RUN apt update && apt install lld clang -y
+RUN cd /root && \
+    curl 'https://static.rust-lang.org/rustup/dist/x86_64-unknown-linux-musl/rustup-init' --output /root/rustup-init && \
+    chmod +x /root/rustup-init && \
+    echo '1' | /root/rustup-init --default-toolchain stable-x86_64-unknown-linux-musl --profile minimal && \
+    echo 'source /root/.cargo/env' >> /root/.bashrc && \
+    rm /root/rustup-init && rm -rf /root/.cargo/registry && rm -rf /root/.cargo/git 
 
-FROM chef as planner
+
+
+
+ENV PATH='/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/root/.cargo/bin'
+
+RUN --mount=type=cache,target=/root/.cargo/registry/index \
+    --mount=type=cache,target=/root/.cargo/registry/cache \
+    --mount=type=cache,target=/root/.cargo/git \
+    rustup component add rust-src --toolchain stable-x86_64-unknown-linux-musl
+
 
 COPY . .
-RUN cargo chef prepare --recipe-path recipe.json
 
-FROM chef as builder
-COPY --from=planner /build/recipe.json recipe.json
+RUN cargo build --release --target x86_64-unknown-linux-musl --bin notary-server --target-dir /root 
 
-RUN apt-get install musl-tools clang llvm -y libssl-dev
-RUN rustup target add x86_64-unknown-linux-musl
+FROM alpine:latest as runtime
 
+WORKDIR /run
+COPY --from=build /root/x86_64-unknown-linux-musl/release/notary-server .
 
-RUN cargo chef cook --release --recipe-path recipe.json
-COPY . .
-RUN cargo build --release --bin notary-server --features "${FEAT}"
-
-
-
-
-FROM alpine:3.20.1 AS runtime
-WORKDIR /build
-
-
-RUN apk add --upgrade --no-cache ca-certificates && update-ca-certificates
-
-
-COPY --from=builder /build/target/release/notary-server notary-server
-
-ENV APP_ENVIRONMENT=production
-
-ENTRYPOINT ["./notary-server"]
+ENTRYPOINT [ "/run/notary-server"]
+CMD [ "--config-file", "/root/config.yaml" ]
