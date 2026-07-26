@@ -1,159 +1,197 @@
 [
   {
     "severity": "high",
-    "location": "rpxy-lib/src/backend/load_balance/load_balance_main.rs:53-64",
-    "title": "Round-Robin Load Balancer TOCTOU Race Causes Out-of-Bounds Panic",
-    "description": "The LoadBalanceRoundRobin::get_ptr() method contains a time-of-check-time-of-use (TOCTOU) race condition between the load of the current pointer value and the subsequent fetch_add or fetch_and. Two concurrent requests can both observe current_ptr at (num_upstreams - 2), both take the fetch_add(1) branch, and the second thread increments the pointer to num_upstreams, which is a valid but out-of-range index. The returned ptr value from fetch_add is the value *before* the increment, so the first caller gets (num_upstreams-2), and the second caller gets (num_upstreams-1). However, a third concurrent call could see current_ptr == num_upstreams (because the second call incremented past num_upstreams-1). It would then take the fetch_and(0) branch and return the stale value num_upstreams as ptr. This value is then used directly as an index into the upstream Vec, causing a panic on Vec::get() returning None, followed by an unwrap in the caller chain. The identical bug exists in LoadBalanceSticky::simple_increment_ptr() at load_balance_sticky.rs:82-91.",
-    "impact": "Under concurrent load, the round-robin pointer can exceed the valid index range. When the returned index is used in UpstreamCandidates::get(), Vec::get() returns None. In the handler code (handler_manipulate_messages.rs:116), `upstream_chosen_opt.ok_or_else(...)` converts this to an error and returns a 500 to the client. While this doesn't panic (thanks to ok_or_else), it causes intermittent 500 errors under concurrent load, effectively a partial denial of service against the load-balanced backend.",
-    "attack_path": "1. Configure rpxy with round_robin load balancing and 2+ upstreams. 2. Send many concurrent requests to the load-balanced path. 3. Race condition between concurrent get_ptr() calls causes ptr to exceed valid range. 4. Requests that draw the out-of-range pointer receive 500 errors. 5. Under sustained concurrent load, this becomes a reliability issue.",
+    "location": ".github/workflows/release_docker.yml:200",
+    "title": "Workflow injection via unescaped PR title in repository-dispatch JSON payload",
+    "description": "The dispatch_release_event job constructs a JSON client-payload by directly interpolating github.event.pull_request.title without toJson() escaping. A PR title containing double quotes can break the JSON structure and inject arbitrary fields, including overriding the 'body' field. While github.event.pull_request.body uses toJson(), the title, head.ref, and base.ref do not. When the dispatched payload is consumed by release.yml, the injected fields propagate to the GitHub Release name, tag, and body.",
+    "impact": "An attacker who gets a PR merged into main from develop can craft a PR title that injects arbitrary JSON into the repository-dispatch payload. This can override the release body with attacker-controlled content (phishing links, fake download URLs), create misleading release names/tags, or corrupt the release metadata. Since releases are a trusted distribution channel, this could facilitate supply chain attacks on downstream consumers.",
+    "attack_path": "1. Attacker opens PR from develop to main with title like: 1.0.0\", \"body\": \"Download from https://evil.example/rpxy\n2. PR gets merged by maintainer (required: write access to develop)\n3. release_docker.yml fires on pull_request closed+merged\n4. Line 200 constructs JSON with unescaped title, injecting a malicious 'body' field\n5. repository-dispatch sends corrupted payload to release.yml\n6. release.yml regex-match extracts '1.0.0' from the payload title (passes validation)\n7. softprops/action-gh-release creates a draft release with attacker-controlled body",
     "evidence": [
-      "rpxy-lib/src/backend/load_balance/load_balance_main.rs:53-64 - load+branch+fetch_add is not atomic",
-      "rpxy-lib/src/backend/load_balance/load_balance_sticky.rs:82-91 - identical pattern",
-      "rpxy-lib/src/backend/upstream.rs:230-234 - upstream.get(pointer_to_upstream.ptr) can return None",
-      "rpxy-lib/src/message_handler/handler_manipulate_messages.rs:116 - ok_or_else prevents panic but returns error"
+      "release_docker.yml:200 - client-payload uses ${{ github.event.pull_request.title }} without toJson()",
+      "release_docker.yml:200 - contrast: body field correctly uses ${{ toJson(github.event.pull_request.body) }}",
+      "release.yml:115 - text: ${{ github.event.client_payload.pull_request.title }} consumed by regex-match",
+      "release.yml:141-143 - title and body used directly in action-gh-release inputs"
     ],
-    "remediation": "Replace the non-atomic load-then-conditional-modify pattern with a single atomic operation. Use fetch_update() or a simple fetch_add with modulo: `let ptr = self.ptr.fetch_add(1, Ordering::Relaxed) % self.num_upstreams;`. This is inherently atomic and always produces a valid index."
+    "remediation": "Wrap all user-controlled interpolations in the client-payload with toJson(): replace ${{ github.event.pull_request.title }} with ${{ toJson(github.event.pull_request.title) }}, and similarly for head.ref and base.ref. Alternatively, construct the payload using a script step with proper JSON escaping via jq."
   },
   {
     "severity": "high",
-    "location": "rpxy-lib/src/forwarder/cache/cache_main.rs:92-187",
-    "title": "Cache TOCTOU: Concurrent Requests Can Serve Partial/Corrupt Cache Data",
-    "description": "The cache put() method has a race condition between the LRU metadata insertion (line 168) and the file write (line 178). The LRU entry is inserted with a CacheFileOrOnMemory::File(path) target *before* the file is actually written to disk. A concurrent get() request for the same cache key can find the LRU entry, attempt to open the file at the path, and either: (a) find no file yet (File::open fails) causing a cache eviction and error, or (b) find a partially written file and stream corrupted data to the client. The hash check in FileStoreInner::read() happens asynchronously *after* data has already started streaming to the client via the unbounded channel (lines 353-377), so corrupted/partial data reaches the client before the hash mismatch is detected.",
-    "impact": "Under concurrent requests for the same cacheable resource, clients can receive truncated or corrupted response bodies. The integrity check (hash verification) runs after data has already been sent downstream, so the client receives partial data before the error is detected. This is a data integrity violation that could cause application-level failures in downstream clients.",
-    "attack_path": "1. Identify a cacheable resource on the proxy. 2. Send two near-simultaneous requests for the same resource. 3. First request triggers cache put(), which inserts LRU entry then starts async file write. 4. Second request triggers cache get(), finds the LRU entry, opens the partially-written file. 5. Second request streams partial file content to the client. 6. Hash check fails asynchronously but data is already sent.",
+    "location": ".github/workflows/*.yml (all four workflows)",
+    "title": "All workflows lack explicit permissions blocks, granting excessive default GITHUB_TOKEN scope",
+    "description": "None of the four GitHub Actions workflows (ci.yml, shift_left.yml, release_docker.yml, release.yml) declare a 'permissions' key. This causes each workflow to inherit the repository's default token permissions, which for repositories created before February 2023 defaults to read+write on all scopes. CI and scan workflows that only need to read code are granted write access to contents, packages, pull-requests, issues, and more.",
+    "impact": "If any step in ci.yml or shift_left.yml is compromised (e.g., via a supply chain attack on a third-party action), the attacker's code executes with a GITHUB_TOKEN that has write permissions to repository contents, packages, pull requests, and more. This enables pushing malicious commits, creating releases, modifying packages, and lateral movement within the organization. For ci.yml running on push events from repo collaborators, the token has full write scope.",
+    "attack_path": "1. Attacker compromises a third-party action used in ci.yml or shift_left.yml (e.g., via tag mutation on actions/checkout@v4 or the already-unpinned ShiftLeftSecurity/scan-action@master)\n2. Compromised action runs with the workflow's GITHUB_TOKEN\n3. Without permissions restrictions, GITHUB_TOKEN has write access to contents, packages, etc.\n4. Attacker uses token to push malicious code, create releases, or modify packages\n5. Supply chain compromise propagates to downstream consumers",
     "evidence": [
-      "rpxy-lib/src/forwarder/cache/cache_main.rs:168 - LRU push happens before file write",
-      "rpxy-lib/src/forwarder/cache/cache_main.rs:177-178 - file write happens after metadata insertion",
-      "rpxy-lib/src/forwarder/cache/cache_main.rs:339-377 - read() streams data before hash verification completes",
-      "rpxy-lib/src/forwarder/cache/cache_main.rs:362-364 - unbounded_send sends data frames before hash is checked at line 370"
+      "ci.yml - no 'permissions:' key at workflow or job level",
+      "shift_left.yml - no 'permissions:' key; GITHUB_TOKEN explicitly passed to third-party action (line 18)",
+      "release_docker.yml - no 'permissions:' key; uses GITHUB_TOKEN for GHCR login (line 123)",
+      "release.yml - no 'permissions:' key; uses default token for release creation"
     ],
-    "remediation": "Write the file to a temporary path first, then atomically rename it to the final path after the write is complete and the hash is verified. Only insert the LRU entry after the file is fully written. Alternatively, use a per-key lock to serialize concurrent put/get operations for the same cache key."
+    "remediation": "Add a top-level 'permissions: {}' (empty/read-all) to each workflow file, then grant only the minimum required permissions at the job level. For ci.yml: 'permissions: { contents: read }'. For shift_left.yml: 'permissions: { contents: read }'. For release_docker.yml: 'permissions: { contents: read, packages: write }'. For release.yml: 'permissions: { contents: write }' (only on the release job)."
   },
   {
     "severity": "high",
-    "location": "rpxy-lib/src/proxy/proxy_main.rs:73-113",
-    "title": "Request Count Race Allows Exceeding max_clients via Increment-Then-Check",
-    "description": "The serve_connection() method uses an increment-then-check pattern: it calls request_count.increment() which atomically increments the counter and returns the *previous* value, then checks if that previous value exceeds max_clients. However, because increment() uses fetch_add which returns the value *before* increment, and the check is `> max_clients` (not `>=`), when exactly max_clients connections arrive simultaneously, they all see a pre-increment value <= max_clients and all proceed. Additionally, because the counter is checked after incrementing, N concurrent arrivals can all increment before any checks, temporarily pushing the count to max_clients + N before decrements happen. This means the actual concurrent connection count can briefly exceed max_clients by the number of simultaneous arrivals.",
-    "impact": "The max_clients limit can be transiently exceeded under burst conditions. With max_clients=512 (default), a burst of 100 simultaneous connections could temporarily push active connections to ~612. This weakens the DoS protection that max_clients is meant to provide.",
-    "attack_path": "1. Determine or guess the max_clients setting (default 512). 2. Open max_clients connections that are kept alive (e.g., slow POST bodies). 3. Rapidly open additional connections in a burst. 4. The increment-then-check pattern allows burst connections through before any decrement occurs. 5. Active connection count temporarily exceeds max_clients.",
+    "location": ".github/workflows/release.yml:112-115, .github/workflows/release_docker.yml:197",
+    "title": "Third-party action kaisugi/action-regex-match pinned to minor tag with low community oversight",
+    "description": "The release workflow uses kaisugi/action-regex-match@v1.0.1, a low-popularity personal GitHub Action, to validate the PR title before creating a release. This action is the gatekeeper for the entire release process: if it passes, binaries are published as a GitHub Release. Additionally, all other third-party actions across all workflows (11 distinct actions) use mutable version tags (v3, v4, v5, v6) instead of immutable commit SHA pins. The ShiftLeftSecurity unpinning is already known, but these other 10+ actions represent additional unpinned supply chain risks.",
+    "impact": "Compromise of the kaisugi/action-regex-match repository (a single-maintainer personal project) could allow an attacker to: (a) bypass the version regex validation, allowing arbitrary strings as release names/tags, (b) exfiltrate the GITHUB_TOKEN or other secrets accessible to the workflow, or (c) modify the workflow outputs to control downstream release creation. For the other unpinned actions (docker/login-action, docker/build-push-action, softprops/action-gh-release, peter-evans/repository-dispatch, etc.), tag mutation attacks could inject malicious code into the CI/CD pipeline.",
+    "attack_path": "1. Attacker compromises kaisugi GitHub account (low-visibility personal account, likely minimal 2FA/security)\n2. Attacker pushes malicious update to v1.0.1 tag of action-regex-match\n3. Next release workflow run uses compromised action\n4. Malicious action always outputs a match, bypassing version validation\n5. release.yml proceeds to create a release with attacker-controlled content\n6. Alternatively: action exfiltrates GITHUB_TOKEN to attacker-controlled server",
     "evidence": [
-      "rpxy-lib/src/count.rs:15-17 - increment() returns the pre-increment value via fetch_add with Relaxed ordering",
-      "rpxy-lib/src/proxy/proxy_main.rs:78-81 - check is on the pre-increment value with > (not >=)",
-      "rpxy-lib/src/proxy/proxy_main.rs:90-113 - spawn happens before any possible decrement"
+      "release.yml:112 - uses: kaisugi/action-regex-match@v1.0.1 (personal action, ~minimal stars/forks)",
+      "release_docker.yml:102 - uses: docker/metadata-action@v5 (tag, not SHA)",
+      "release_docker.yml:106 - uses: docker/setup-qemu-action@v3 (tag, not SHA)",
+      "release_docker.yml:109 - uses: docker/setup-buildx-action@v3 (tag, not SHA)",
+      "release_docker.yml:113 - uses: docker/login-action@v3 (tag, not SHA, handles Docker Hub creds)",
+      "release_docker.yml:141,158,175 - uses: docker/build-push-action@v6 (tag, not SHA)",
+      "release_docker.yml:197 - uses: peter-evans/repository-dispatch@v3 (tag, not SHA)",
+      "release.yml:138 - uses: softprops/action-gh-release@v2 (tag, not SHA)"
     ],
-    "remediation": "Use a check-then-increment pattern with compare_exchange in a loop: load current count, check if it's < max_clients, then CAS to increment. Only proceed if CAS succeeds. This guarantees the count never exceeds max_clients. Alternatively, use a tokio::sync::Semaphore with max_clients permits."
+    "remediation": "Pin all third-party actions to their full commit SHA instead of version tags. For example, replace 'kaisugi/action-regex-match@v1.0.1' with 'kaisugi/action-regex-match@<full-sha> # v1.0.1'. Apply the same pinning to all docker/*, peter-evans/*, and softprops/* actions. Use Dependabot's existing github-actions ecosystem entry (already configured) to receive automated PRs when pinned SHAs have newer releases. Consider replacing kaisugi/action-regex-match with an inline shell script using grep/bash regex to eliminate the third-party dependency entirely."
   },
   {
     "severity": "medium",
-    "location": "rpxy-lib/src/proxy/proxy_main.rs:222-241 and rpxy-lib/src/message_handler/handler_main.rs:222-238",
-    "title": "Upgraded WebSocket/Connection Streams Have No Timeout or Size Limit",
-    "description": "When an HTTP connection is upgraded (e.g., WebSocket), the bidirectional copy (copy_bidirectional) runs indefinitely with no timeout, no data transfer limit, and no idle detection. The connection_handling_timeout wraps the initial serve_connection_with_upgrades future, but the upgrade spawn at handler_main.rs:222 creates a new independent task that is not bounded by any timeout. This task runs copy_bidirectional() which will keep running as long as both sides keep the connection alive, even if they exchange no data.",
-    "impact": "An attacker can open WebSocket upgrade connections and keep them alive indefinitely by sending periodic WebSocket pings. Each such connection consumes a file descriptor, a tokio task, and associated memory. Since WebSocket connections also bypass max_clients (already known), this compounds the resource exhaustion. Even without bypassing max_clients, legitimate but idle WebSocket connections can hold resources indefinitely.",
-    "attack_path": "1. Establish HTTP/1.1 connection to the proxy. 2. Send an Upgrade: websocket request to a backend that supports WebSocket. 3. Complete the WebSocket handshake. 4. The proxy spawns a copy_bidirectional task with no timeout. 5. Send periodic WebSocket pings to keep the connection alive. 6. The connection persists indefinitely, consuming server resources. 7. Repeat to exhaust file descriptors or memory.",
+    "location": "docker/entrypoint.sh:14,147-152",
+    "title": "Path traversal via CONFIG_FILENAME environment variable enables arbitrary config file loading",
+    "description": "The CONFIG_FILENAME environment variable is used to construct a file path without any sanitization or path traversal protection. The value is interpolated into CONFIG_DIR/CONFIG_FILE_IN_DIR and used in a symlink creation (ln -s). An attacker who can control this environment variable can traverse outside the /rpxy/config directory and cause rpxy to load a configuration file from any readable location in the container filesystem.",
+    "impact": "By setting CONFIG_FILENAME to a path traversal payload (e.g., '../../tmp/malicious.toml'), an attacker can force rpxy to load a config from an arbitrary path. A malicious config could: (a) redirect proxied traffic to attacker-controlled upstream servers, enabling traffic interception/MitM, (b) expose internal services by adding them as backends, (c) disable TLS verification for upstream connections, or (d) change ACME settings to obtain certificates for the attacker's benefit. This requires the ability to set environment variables (e.g., via docker-compose override, Kubernetes env injection, or container orchestration misconfiguration).",
+    "attack_path": "1. Attacker gains ability to set container environment variables (e.g., via compromised docker-compose override, K8s configmap, or container orchestration API)\n2. Attacker sets CONFIG_FILENAME=../../tmp/evil.toml\n3. Attacker writes evil.toml to a writable volume mount (e.g., /rpxy/cache mapped to host writable path)\n4. entrypoint.sh line 147: checks /rpxy/config/../../tmp/evil.toml = /tmp/evil.toml exists\n5. entrypoint.sh line 152: creates symlink /etc/rpxy.toml -> /tmp/evil.toml\n6. rpxy loads attacker's config, proxying traffic to attacker-controlled backends",
     "evidence": [
-      "rpxy-lib/src/message_handler/handler_main.rs:222-238 - spawn with no timeout wrapping copy_bidirectional",
-      "rpxy-lib/src/proxy/proxy_main.rs:105-108 - connection_handling_timeout wraps serve_connection, but the upgrade task is spawned independently inside the handler"
+      "docker/entrypoint.sh:14 - CONFIG_FILE_IN_DIR=${CONFIG_FILENAME:-rpxy.toml} (no sanitization)",
+      "docker/entrypoint.sh:147 - if [[ ! -f ${CONFIG_DIR}/${CONFIG_FILE_IN_DIR} ]]; then (path traversal in file check)",
+      "docker/entrypoint.sh:152 - ln -s ${CONFIG_DIR}/${CONFIG_FILE_IN_DIR} ${CONFIG_FILE} (symlink with traversal)",
+      "docker/docker-compose.yml:29-30 - ./cache:/rpxy/cache:rw (writable volume for staging malicious config)"
     ],
-    "remediation": "Apply a maximum lifetime timeout to the spawned upgrade task. Wrap the copy_bidirectional call in tokio::time::timeout with a configurable maximum upgrade connection duration. Also consider adding idle detection (no data transferred for N seconds)."
+    "remediation": "Sanitize CONFIG_FILENAME by stripping path separators and parent directory references: CONFIG_FILE_IN_DIR=$(basename \"${CONFIG_FILENAME:-rpxy.toml}\"). Additionally, after constructing the full path, validate it resolves within CONFIG_DIR using realpath: RESOLVED=$(realpath -m \"${CONFIG_DIR}/${CONFIG_FILE_IN_DIR}\") && [[ \"$RESOLVED\" == \"${CONFIG_DIR}\"* ]] || exit 1."
   },
   {
     "severity": "medium",
-    "location": "rpxy-lib/src/proxy/mod.rs:27-48",
-    "title": "No HTTP/2 Header List Size Limit Enables Header Bomb Memory Exhaustion",
-    "description": "The HTTP/2 server connection builder (ConnectionBuilder) does not configure max_header_list_size(). Hyper's default for HTTP/2 max_header_list_size is 16MB (16 * 1024 * 1024 = 16777216 bytes). An attacker can send an HTTP/2 request with headers totaling up to 16MB. With max_concurrent_streams=64 (default), a single HTTP/2 connection can have 64 concurrent streams each with 16MB of headers, consuming approximately 1GB of memory per connection. With max_clients=512 connections, this scales to ~512GB theoretical maximum header memory.",
-    "impact": "An attacker can exhaust server memory by sending HTTP/2 requests with very large header lists. With default settings (max_concurrent_streams=64, max_clients=512), even a modest attack of a few connections with large headers can consume gigabytes of memory, leading to OOM kills or severe performance degradation.",
-    "attack_path": "1. Establish HTTP/2 connection to the proxy. 2. Open max_concurrent_streams (64) concurrent streams. 3. On each stream, send a request with ~16MB of header data (e.g., many large custom headers). 4. Memory consumption: 64 streams * 16MB headers = ~1GB per connection. 5. Open multiple connections to amplify. 6. Server runs out of memory.",
+    "location": "docker/rpxy-Dockerfile:38",
+    "title": "Rustup installed via unauthenticated pipe-to-shell pattern in Docker build",
+    "description": "The builder stage installs Rust toolchain by piping curl output directly to bash: 'curl -sSf https://sh.rustup.rs | bash -s --'. This classic pipe-to-shell pattern has no integrity verification (no checksum, no signature verification, no GPG check). The -s flag suppresses progress output, and -S shows errors, but -f (fail on HTTP errors) only catches HTTP-level failures, not content tampering.",
+    "impact": "If the rustup CDN (static.rust-lang.org / sh.rustup.rs) is compromised, MITM'd, or experiences a supply chain attack, arbitrary code executes as root inside the Docker build container. This could inject backdoors into the compiled rpxy binary that ships in the final Docker image. The same risk exists in tlsnotary-Dockerfile:7 which downloads rustup-init directly. Since Docker layer caching means the compromise persists across rebuilds until the cache is invalidated, a temporary compromise could have lasting effects.",
+    "attack_path": "1. Attacker compromises CDN serving sh.rustup.rs or performs DNS/BGP hijack\n2. Modified rustup installer includes backdoor that patches cargo or rustc\n3. Docker build stage fetches and executes compromised installer as root\n4. Backdoored compiler inserts malicious code into rpxy binary during 'cargo build'\n5. Compromised binary is copied to runner stage (line 64: COPY --from=builder)\n6. Docker image is pushed to GHCR/Docker Hub via release_docker.yml\n7. All consumers pulling the image receive backdoored rpxy binary",
     "evidence": [
-      "rpxy-lib/src/proxy/mod.rs:30-38 - http2() builder does not call max_header_list_size()",
-      "rpxy-lib/src/constants.rs:7 - MAX_CONCURRENT_STREAMS is 64",
-      "rpxy-lib/src/constants.rs:6 - MAX_CLIENTS is 512"
+      "docker/rpxy-Dockerfile:38 - curl -sSf https://sh.rustup.rs | bash -s -- -y --default-toolchain stable",
+      "docker/tlsnotary-Dockerfile:7 - curl 'https://static.rust-lang.org/rustup/dist/x86_64-unknown-linux-musl/rustup-init' --output /root/rustup-init (no checksum verification)",
+      "docker/rpxy-Dockerfile:64 - COPY --from=builder /tmp/target/release/rpxy /rpxy/bin/rpxy (binary from potentially compromised build)"
     ],
-    "remediation": "Configure a reasonable max_header_list_size on the HTTP/2 builder, e.g., `http_server.http2().max_header_list_size(64 * 1024);` (64KB is a common safe default). Also consider configuring max_send_buf_size to limit per-connection memory usage."
+    "remediation": "Download rustup-init as a separate step and verify its SHA-256 checksum against a known-good value before execution. For rpxy-Dockerfile: 'curl -sSf -o /tmp/rustup-init https://static.rust-lang.org/rustup/dist/x86_64-unknown-linux-gnu/rustup-init && echo \"<expected-sha256> /tmp/rustup-init\" | sha256sum -c - && chmod +x /tmp/rustup-init && /tmp/rustup-init -y'. Use official Rust Docker images (rust:1.XX) as the builder base instead of installing rustup manually."
   },
   {
     "severity": "medium",
-    "location": "rpxy-lib/src/proxy/proxy_main.rs:160-303",
-    "title": "Certificate Reload Race: Stale server_crypto_map After Failed Update",
-    "description": "In tls_listener_service(), the certificate reload handling (lines 284-298) replaces server_crypto_map atomically only on success. However, if the try_into() conversion at line 290 succeeds but produces a ServerCrypto with only a subset of expected server names (e.g., because one certificate file is temporarily invalid during rotation), the proxy will serve the partial set of certificates. Connections for the missing server names will fail with NoTlsServingApp errors. The old certificates are completely discarded even if only some new certificates are valid. There is no rollback mechanism.",
-    "impact": "During certificate rotation, if one certificate file is temporarily in an invalid state (e.g., being written atomically but the key file is not yet updated), the proxy can load a partial certificate set. This causes TLS handshake failures for the affected server names, resulting in a partial outage. The old valid certificates are discarded with no fallback.",
-    "attack_path": "1. This is primarily a reliability issue during certificate rotation. 2. If an attacker can influence certificate file timing (e.g., by racing an ACME challenge), they could cause a window where some domains lose TLS service. 3. The server_crypto_base is rebuilt from scratch on each reload (reloader_service.rs:46-59), with individual server failures only logged and skipped (line 52). 4. The proxy replaces the entire map atomically (proxy_main.rs:298), so domains whose certs failed to load become unreachable.",
+    "location": "docker/rpxy-Dockerfile:48-75",
+    "title": "Container runtime stage runs as root with no USER directive",
+    "description": "The runner stage of rpxy-Dockerfile does not include a USER directive. While entrypoint.sh creates a non-root user and uses gosu to drop privileges before running rpxy, the entrypoint itself executes as root. This means all initialization code (user creation, logrotate setup, cron configuration, chown operations, symlink creation) runs with full root privileges. If any of the environment-variable injection vulnerabilities (CONFIG_FILENAME, HOST_USER, etc.) are exploited, the injected commands execute as root.",
+    "impact": "The root execution context during entrypoint processing amplifies the impact of all injection vulnerabilities in entrypoint.sh. Command injection via environment variables executes with root privileges inside the container. Combined with the privileged:true setting (known issue), this provides unrestricted host access. Even without privileged mode, root in the container can: modify system binaries, install packages, access all container filesystems, and potentially escape to the host via kernel vulnerabilities.",
+    "attack_path": "1. Attacker controls an environment variable (e.g., CONFIG_FILENAME with path traversal)\n2. Container starts, entrypoint.sh runs as root (PID 1)\n3. Injection payload executes with root privileges during initialization\n4. Attacker gains root shell inside container before privilege drop occurs\n5. Root access enables mounting host filesystems, loading kernel modules (if privileged), or container escape",
     "evidence": [
-      "rpxy-lib/src/proxy/proxy_main.rs:284-298 - reload replaces entire map, no rollback",
-      "rpxy-certs/src/reloader_service.rs:46-59 - failed cert reads are skipped with continue, producing partial map",
-      "rpxy-lib/src/proxy/proxy_main.rs:210-212 - missing server_name returns NoTlsServingApp error"
+      "docker/rpxy-Dockerfile:48 - FROM --platform=$TARGETPLATFORM base AS runner (no USER directive follows)",
+      "docker/rpxy-Dockerfile:75 - ENTRYPOINT [\"/usr/bin/bash\", \"/rpxy/entrypoint.sh\"] (runs as root)",
+      "docker/entrypoint.sh:110 - if [ $(whoami) != \"root\" ... ] (explicitly checks for root execution)",
+      "docker/entrypoint.sh:162 - gosu ${USER} sh -c \"/rpxy/run.sh\" (privilege drop happens late in the script)"
     ],
-    "remediation": "Implement a merge-on-success strategy: only replace individual server certificates that successfully loaded, keeping the previous valid certificate for any server that failed to reload. Alternatively, only apply the new certificate map if all certificates loaded successfully, falling back to the previous map otherwise."
+    "remediation": "Add a dedicated stage or use a multi-stage entrypoint pattern. Create the rpxy user at build time with fixed UID/GID in the Dockerfile, set 'USER rpxy' as the default, and use Docker's --init flag (already in docker-compose.yml) for PID 1. Move initialization requiring root to a separate init container or a one-shot setup script. If root initialization is unavoidable, minimize the code running as root and drop privileges as early as possible."
   },
   {
     "severity": "medium",
-    "location": "rpxy-lib/src/forwarder/cache/cache_main.rs:317-393",
-    "title": "FileStoreInner::cnt Can Underflow via Concurrent Remove Without Lock Coordination",
-    "description": "FileStoreInner::cnt is a plain usize (not atomic), and it is decremented in remove() (line 389: self.cnt -= 1). The FileStoreInner is behind an Arc<RwLock<FileStoreInner>>, so concurrent writes should be serialized. However, there is a path where remove() is called from within read() (line 373), which holds only a read lock via the clone of self_clone. This clone has its own copy of cnt (FileStoreInner derives Clone), so the decrement on the clone does not affect the original. Additionally, the cnt on the original can underflow: if evict() is called on a path that was already removed by the hash-mismatch path in read(), the second remove will fail with FailedToRemoveCacheFile (file already deleted), but if the file happened to be recreated by a concurrent put, the cnt will be decremented again, going below the actual count.",
-    "impact": "The file cache count (cnt) becomes inconsistent with the actual number of cached files. This is a bookkeeping error that could lead to incorrect cache statistics. Since cnt is only used for count() which feeds debug logging, the operational impact is low, but it indicates broader synchronization issues in the cache layer.",
-    "attack_path": "1. Send requests to create file cache entries. 2. Send concurrent requests that trigger hash mismatches in read() (via the file corruption race in finding #2). 3. The cloned self_clone's remove() modifies a copy of cnt, not the original. 4. Concurrent evict() from the stale-cache path also tries to remove the same file. 5. cnt becomes inconsistent.",
+    "location": "docker/tlsnotary-Dockerfile:1,28,31",
+    "title": "TLSNotary container runs as root with unpinned alpine:latest base image",
+    "description": "The tlsnotary-Dockerfile uses 'alpine:latest' (mutable tag) for both build and runtime stages, and the runtime stage has no USER directive. The notary-server binary runs as root. Unlike rpxy-Dockerfile which at least drops privileges via gosu, this Dockerfile has no privilege-dropping mechanism at all. The 'latest' tag means the base image can change without notice, potentially introducing vulnerabilities or breaking changes.",
+    "impact": "The notary-server runs with full root privileges inside the container. If a vulnerability exists in the notary-server binary or its dependencies, exploitation gives the attacker root access. Using alpine:latest means: (a) builds are not reproducible, (b) a compromised Alpine repository could inject malicious packages, and (c) there is no way to audit which exact base image was used for a given container build. The notary server handles cryptographic operations (TLS notarization), making root access particularly sensitive.",
+    "attack_path": "1. Attacker discovers vulnerability in notary-server (e.g., input parsing, network handling)\n2. Exploitation yields a shell running as root inside the container\n3. Root access allows: reading private keys/certificates, modifying notarization results, pivoting to other containers on the network\n4. Separately: compromised Alpine mirror pushes malicious 'latest' base image\n5. Next Docker build inherits compromised base, affecting all future container instances",
     "evidence": [
-      "rpxy-lib/src/forwarder/cache/cache_main.rs:349 - self.clone() inside read() creates a copy of cnt",
-      "rpxy-lib/src/forwarder/cache/cache_main.rs:373 - self_clone.remove() modifies the clone's cnt, not the locked original",
-      "rpxy-lib/src/forwarder/cache/cache_main.rs:385-393 - remove decrements cnt unconditionally",
-      "rpxy-lib/src/forwarder/cache/cache_main.rs:295 - derives Clone for FileStoreInner"
+      "docker/tlsnotary-Dockerfile:1 - FROM alpine:latest as build (unpinned mutable tag)",
+      "docker/tlsnotary-Dockerfile:28 - FROM alpine:latest as runtime (unpinned mutable tag)",
+      "docker/tlsnotary-Dockerfile:33 - ENTRYPOINT [\"/run/notary-server\"] (no USER directive, runs as root)",
+      "docker/tlsnotary-Dockerfile:7 - curl without checksum verification for rustup-init"
     ],
-    "remediation": "Use AtomicUsize for the file count or avoid cloning FileStoreInner. The read-path hash-mismatch removal should signal the outer FileStore to perform the eviction under the write lock, rather than trying to modify state through a cloned copy."
+    "remediation": "Pin the Alpine base image to a specific version with digest: 'FROM alpine:3.20@sha256:<digest>'. Add a non-root user in the runtime stage and set USER directive: 'RUN adduser -D -u 1000 notary && USER notary'. Verify the rustup-init download checksum before execution."
   },
   {
     "severity": "medium",
-    "location": "rpxy-lib/src/proxy/proxy_main.rs:77-81",
-    "title": "No Connection Timeout on Cleartext HTTP Accept Loop Enables Slow Connection Exhaustion",
-    "description": "The start_without_tls() method (lines 117-129) accepts TCP connections and immediately passes them to serve_connection(). There is no connection_handling_timeout applied when connection_handling_timeout is None (the default). The hyper server has header_read_timeout set to proxy_idle_timeout (default 20 seconds), which helps, but once headers are read, if the upstream backend is slow to respond or the client is slow to read the response, the connection can be held open indefinitely. The default connection_handling_timeout is None, meaning there is no overall time limit on connection handling.",
-    "impact": "Without connection_handling_timeout configured (which is the default), connections that pass the header read phase can be held open indefinitely. An attacker can send a valid request header, then read the response extremely slowly (1 byte per second), holding the connection and its associated resources for hours. With max_clients=512, this requires only 512 such connections to exhaust the connection limit.",
-    "attack_path": "1. Open a TCP connection to the HTTP cleartext port. 2. Send valid HTTP/1.1 request headers within the 20-second header_read_timeout. 3. The proxy forwards the request to the upstream and begins sending the response. 4. Read the response at 1 byte per second (slow-read attack). 5. The connection is held open indefinitely since connection_handling_timeout defaults to None. 6. Repeat 512 times to exhaust max_clients. 7. All subsequent legitimate connections are rejected.",
+    "location": "docker/docker-compose.yml:55-56",
+    "title": "Volume mount shadowing causes fixture directory to override config directory in tlsnotary service",
+    "description": "The tlsnotary service has two volume mounts targeting the same container path '/workspace'. The second mount (fixture directory) silently shadows the first (config directory) due to Docker's mount ordering behavior. This means test fixture data (likely containing test private keys and certificates) is what actually gets mounted at /workspace, while the intended configuration directory is inaccessible.",
+    "impact": "The tlsnotary notary-server may operate with test/fixture credentials instead of production credentials. Test private keys from the fixture directory are typically well-known (checked into source control) and provide no actual security. If this configuration is used in production, TLS notarization operations would use predictable test keys, completely undermining the cryptographic guarantees of the notarization protocol. Additionally, any secrets in the fixture directory are exposed to the container.",
+    "attack_path": "1. Operator deploys tlsnotary using docker-compose.yml as-is\n2. Docker mounts ../submodules/tlsn/crates/notary/server/config:/workspace:ro (first)\n3. Docker mounts ../submodules/tlsn/crates/notary/server/fixture:/workspace:ro (second, shadows first)\n4. Container's /workspace contains fixture data (test keys/certs) instead of production config\n5. Notary server uses test credentials for TLS operations\n6. Attacker who knows the well-known test private keys can forge notarization proofs",
     "evidence": [
-      "rpxy-lib/src/globals.rs:104 - connection_handling_timeout defaults to None",
-      "rpxy-lib/src/proxy/proxy_main.rs:105-108 - timeout only applied if connection_handling_timeout is Some",
-      "rpxy-lib/src/proxy/proxy_main.rs:107 - without timeout, fut.await runs indefinitely",
-      "rpxy-lib/src/constants.rs:6 - MAX_CLIENTS is only 512"
+      "docker/docker-compose.yml:55 - ../submodules/tlsn/crates/notary/server/config:/workspace:ro (shadowed mount)",
+      "docker/docker-compose.yml:56 - ../submodules/tlsn/crates/notary/server/fixture:/workspace:ro (shadowing mount)",
+      "docker/tlsnotary-Dockerfile:34 - CMD [\"--config-file\", \"/root/config.yaml\"] (config path mismatch: /root vs /workspace)"
     ],
-    "remediation": "Set a default connection_handling_timeout (e.g., 300 seconds) rather than defaulting to None. This ensures connections cannot be held open indefinitely even if the administrator doesn't explicitly configure a timeout."
+    "remediation": "Mount each host directory to a separate container path: map config to '/workspace/config' and fixture to '/workspace/fixture' (or remove the fixture mount entirely for production). Verify that the notary-server's --config-file path matches the actual mount location. Remove test fixture mounts from production compose files."
   },
   {
     "severity": "medium",
-    "location": "rpxy-lib/src/message_handler/handler_main.rs:99-105",
-    "title": "SNI Consistency Check Bypass When sni_consistency is Disabled Enables Backend Confusion",
-    "description": "When sni_consistency is disabled (configurable, though default is true), the proxy routes requests based on the Host header alone, ignoring the TLS SNI. An attacker can establish a TLS connection using SNI for domain A (which they control or have a certificate for), then send HTTP requests with Host: domain-B headers. The proxy will route these requests to domain-B's backend, but the TLS certificate presented to the client was for domain-A. This is a form of backend confusion where the attacker can access backends they shouldn't be able to reach, or where the backend sees traffic it believes came via its own domain.",
-    "impact": "When sni_consistency is disabled, an attacker can route requests to any configured backend by manipulating the Host header, regardless of which TLS certificate was used for the connection. This can be used to bypass per-domain access controls if the backend relies on the proxy's TLS termination for domain validation.",
-    "attack_path": "1. Ensure target proxy has sni_consistency disabled (not default, but configurable). 2. Establish TLS connection with SNI set to a domain the attacker controls. 3. Send HTTP requests with Host header set to a different domain configured on the proxy. 4. The proxy routes the request to the second domain's backend. 5. The backend sees a valid request that appears to come from its domain.",
+    "location": ".dockerignore:1-7",
+    "title": "Missing .git exclusion in .dockerignore leaks repository history into Docker build context",
+    "description": "The .dockerignore file excludes target/, .vscode/, .private/, .github/, example-certs/, and legacy-lib/, but does NOT exclude the .git/ directory. When 'COPY . /tmp/' executes in rpxy-Dockerfile (line 16), the entire .git directory—including full commit history, potentially sensitive deleted content, branch metadata, and any secrets that were ever committed then removed—is copied into the builder stage. Similarly, tlsnotary-Dockerfile's 'COPY . .' (line 24) copies .git from its build context.",
+    "impact": "Git history may contain secrets, credentials, configuration files, or sensitive code that were committed and later removed. These are preserved in .git/objects and become accessible in the builder Docker layer. While the runner stage only copies the final binary, the builder layer is cached and may be pushed to registries if layer caching is used (e.g., with type=gha cache in release_docker.yml). An attacker with access to the Docker layer cache or build environment could extract historical secrets from the .git directory.",
+    "attack_path": "1. Developer accidentally commits a secret (API key, private key) and later removes it\n2. Secret persists in .git/objects/\n3. Docker build copies .git/ into builder stage (rpxy-Dockerfile:16)\n4. Builder layer is cached via 'cache-to: type=gha' in release_docker.yml\n5. Attacker with access to GitHub Actions cache extracts builder layer\n6. Attacker runs 'git log --all --diff-filter=D' in the extracted .git to find deleted secrets",
     "evidence": [
-      "rpxy-lib/src/message_handler/handler_main.rs:101-105 - SNI check only when sni_consistency is true",
-      "rpxy-lib/src/message_handler/handler_main.rs:94-97 - server_name derived from Host header only",
-      "rpxy-lib/src/message_handler/handler_main.rs:107-116 - routing uses Host-derived server_name"
+      ".dockerignore:1-7 - lists exclusions but .git/ is absent",
+      "docker/rpxy-Dockerfile:16 - COPY . /tmp/ (copies entire context including .git)",
+      "docker/tlsnotary-Dockerfile:24 - COPY . . (copies entire context including .git)",
+      ".github/workflows/release_docker.yml:151-152 - cache-from/cache-to: type=gha (layer cache shared in CI)"
     ],
-    "remediation": "Consider making sni_consistency a mandatory check that cannot be disabled, or at minimum log a security warning when it is disabled. When sni_consistency is disabled, consider limiting request routing to only the backend that matches the TLS SNI, using the Host header only as a secondary hint."
+    "remediation": "Add '.git/' and '.git' to .dockerignore. Also add other potentially sensitive paths: '*.md', 'docker/', '.build/', '.env*', '*.pem', '*.key'. Use a minimal .dockerignore allowlist pattern instead of a denylist."
   },
   {
     "severity": "medium",
-    "location": "rpxy-lib/src/message_handler/utils_headers.rs:196-232",
-    "title": "X-Forwarded-For Header Spoofing via Append Semantics",
-    "description": "The add_forwarding_header() function uses append_header_entry_with_comma() for X-Forwarded-For, which appends the client address to any existing X-Forwarded-For header. An external attacker can set an arbitrary X-Forwarded-For header in their request (e.g., 'X-Forwarded-For: 10.0.0.1'), and the proxy will append the real client IP, resulting in 'X-Forwarded-For: 10.0.0.1, <real-ip>'. Backends that use the *first* value of X-Forwarded-For (a common pattern) will see the spoofed IP. While add_header_entry_overwrite_if_exist is used for x-real-ip (line 224), correctly overwriting the attacker's value, the X-Forwarded-For append behavior is the standard for multi-hop proxies. However, this proxy is typically the first hop from the internet, meaning it should strip or replace any incoming X-Forwarded-For header from untrusted clients.",
-    "impact": "Backend applications that trust the first entry in X-Forwarded-For for IP-based access control, rate limiting, or logging will use the attacker-controlled spoofed IP instead of the real client IP. This can bypass IP-based restrictions on backend applications.",
-    "attack_path": "1. Send a request with header 'X-Forwarded-For: 127.0.0.1' to the proxy. 2. The proxy appends the real client IP: 'X-Forwarded-For: 127.0.0.1, <real-ip>'. 3. Backend receives the request with spoofed first entry. 4. If backend uses the first X-Forwarded-For value for access control, attacker bypasses IP restrictions.",
+    "location": "config.toml:47,94",
+    "title": "Production domain name and operator email exposed in committed configuration file",
+    "description": "The root config.toml contains a real production domain name ('covert.codes') and a real email address ('mac@covert.codes') used for ACME certificate registration. This file is committed to a public repository, exposing operational infrastructure details that should be private or parameterized.",
+    "impact": "Exposure of the production domain enables targeted attacks against the actual deployment: reconnaissance, DDoS targeting, and vulnerability scanning against covert.codes. The ACME email (mac@covert.codes) identifies the operator and can be used for social engineering, credential stuffing, or phishing attacks. The config also reveals the architecture (reverse proxy to localhost:7047 for TLSNotary), the TLS configuration (ACME-based), and that HTTP/3 is enabled—all useful for an attacker profiling the target.",
+    "attack_path": "1. Attacker discovers the public GitHub repository\n2. config.toml reveals: domain = covert.codes, email = mac@covert.codes, upstream = localhost:7047\n3. Attacker maps the infrastructure: rpxy on 443 proxying to TLSNotary on 7047\n4. Attacker targets covert.codes with known rpxy/TLSNotary vulnerabilities\n5. Alternatively: attacker uses mac@covert.codes for targeted phishing to gain repo access",
     "evidence": [
-      "rpxy-lib/src/message_handler/utils_headers.rs:208 - append_header_entry_with_comma for x-forwarded-for",
-      "rpxy-lib/src/message_handler/utils_headers.rs:128-144 - append_header_entry_with_comma preserves existing values",
-      "rpxy-lib/src/message_handler/utils_headers.rs:85-87 - remove_hop_header does not include x-forwarded-for"
+      "config.toml:47 - server_name = 'covert.codes'",
+      "config.toml:54 - tls = { https_redirection = true, acme = true }",
+      "config.toml:55 - reverse_proxy = [{ upstream = [{ location = 'localhost:7047', tls = false }] }]",
+      "config.toml:94 - email = \"mac@covert.codes\"",
+      "config.toml:34 - default_app = 'tlsnotary'"
     ],
-    "remediation": "When the proxy is the edge/first-hop proxy (the common deployment), it should replace (not append to) the X-Forwarded-For header with the actual client IP. Add a configuration option to control whether the proxy operates in 'edge' mode (replace X-Forwarded-For) or 'intermediate' mode (append to X-Forwarded-For)."
+    "remediation": "Replace production values with example placeholders (e.g., 'example.com', 'admin@example.com'). Use environment variable substitution or a separate untracked config file for production values. Add production config files to .gitignore. Provide a config.toml.example with safe defaults."
   },
   {
     "severity": "medium",
-    "location": "rpxy-lib/src/forwarder/cache/cache_main.rs:108-183",
-    "title": "Unbounded BytesMut Accumulation in Cache Put Path Enables Memory Exhaustion",
-    "description": "In the cache put() method's spawned task, response body frames are accumulated into a BytesMut buffer (line 110: let mut buf = BytesMut::new()) up to max_each_size (default 65535 bytes). However, the size check (line 130) only triggers after the current frame has already been added to buf (line 141). If a single frame exceeds max_each_size, the buffer will contain the entire oversized frame before the check triggers. More importantly, this buffering happens in a spawned task per cacheable response, and there is no global limit on how many cache-put operations can run concurrently. If many different cacheable URIs are requested simultaneously, each spawns a task that buffers up to max_each_size bytes, potentially consuming significant memory.",
-    "impact": "With many concurrent requests for different cacheable resources, the proxy can accumulate significant memory in in-flight cache put operations. Each operation buffers up to 65535 bytes (default max_each_size). With 512 concurrent connections, this is ~32MB, which is manageable. However, if max_each_size is configured to a larger value, this scales linearly.",
-    "attack_path": "1. Identify or create many distinct cacheable resources on backends. 2. Send concurrent requests for different cacheable resources. 3. Each request spawns a cache-put task that buffers the response body. 4. Memory consumption: num_concurrent * max_each_size bytes. 5. With elevated max_each_size settings, this can be significant.",
+    "location": ".github/workflows/release_docker.yml:20",
+    "title": "Always-true job condition in build_and_push allows Docker image build on unmerged closed PRs",
+    "description": "The build_and_push job's 'if' condition uses two separate ${{ }} expression blocks joined by '||' as a literal string: '${{ expr1 }} || ${{ expr2 }}'. GitHub Actions evaluates each ${{ }} independently, producing strings 'true' or 'false', then concatenates them with the literal ' || '. The result is always a non-empty string (e.g., 'false || false'), which is always truthy. This means the job runs on EVERY trigger event regardless of the intended conditions. Notably, this is a distinct instance from the known always-true condition in release.yml—this one affects Docker image builds.",
+    "impact": "When a PR to main is closed WITHOUT merging, the build_and_push job still starts, executing the checkout step and Docker login steps (authenticating to both Docker Hub and GHCR with secrets). While the inner build steps have their own conditions that prevent actual image pushes, the unnecessary job execution: (a) exposes Docker Hub credentials and GITHUB_TOKEN to an execution context that should not run, (b) wastes CI resources, and (c) creates a larger attack surface if any step is later added without proper conditional guards.",
+    "attack_path": "1. Attacker opens a PR from develop to main with malicious Dockerfile changes\n2. PR is closed without merging (reviewer rejects it)\n3. release_docker.yml triggers on pull_request closed event\n4. build_and_push job runs despite PR not being merged (always-true condition)\n5. Steps 95-123 execute: checkout of main branch code, Docker Hub login with secrets, GHCR login\n6. If a future contributor adds a build step without proper 'if' guard, malicious images could be pushed",
     "evidence": [
-      "rpxy-lib/src/forwarder/cache/cache_main.rs:108-182 - spawned task per cacheable response",
-      "rpxy-lib/src/forwarder/cache/cache_main.rs:110 - BytesMut::new() with no pre-allocation limit",
-      "rpxy-lib/src/forwarder/cache/cache_main.rs:141 - buf.extend before size check on next iteration"
+      "release_docker.yml:20 - if: ${{ github.event_name == 'push' }} || ${{ github.event_name == 'pull_request' && github.event.pull_request.merged == true }}",
+      "release_docker.yml:113-116 - Docker Hub login executes unconditionally within the job",
+      "release_docker.yml:118-123 - GHCR login with GITHUB_TOKEN executes unconditionally"
     ],
-    "remediation": "Limit the number of concurrent cache-put operations using a semaphore. Consider streaming cache writes to disk instead of buffering the entire body in memory before writing."
+    "remediation": "Combine the conditions into a single ${{ }} expression block: if: ${{ github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.pull_request.merged == true) }}. This ensures proper boolean evaluation instead of string concatenation."
+  },
+  {
+    "severity": "medium",
+    "location": "docker/rpxy-Dockerfile:73",
+    "title": "Malformed CMD instruction creates ambiguous container startup behavior",
+    "description": "Line 73 contains CMD [\"/usr/bin/bash\" \"/rpxy/entrypoint.sh\"] with a missing comma between the two elements, making it a single-element array with the concatenated string '/usr/bin/bash /rpxy/entrypoint.sh'. Line 75 then defines ENTRYPOINT [\"/usr/bin/bash\", \"/rpxy/entrypoint.sh\"] which takes precedence. When both CMD and ENTRYPOINT are defined, CMD provides default arguments to ENTRYPOINT. The malformed CMD string becomes an unexpected extra argument passed to entrypoint.sh.",
+    "impact": "The entrypoint script receives an unexpected extra argument ('/usr/bin/bash /rpxy/entrypoint.sh' as $1). While entrypoint.sh currently ignores positional arguments, this creates fragile behavior: if entrypoint.sh is ever modified to process arguments (e.g., for command overrides), the phantom argument could cause unexpected behavior or bypass security checks. More immediately, this prevents users from overriding CMD to pass custom arguments to the entrypoint, as the malformed default CMD is always appended.",
+    "evidence": [
+      "docker/rpxy-Dockerfile:73 - CMD [\"/usr/bin/bash\" \"/rpxy/entrypoint.sh\"] (missing comma between elements)",
+      "docker/rpxy-Dockerfile:75 - ENTRYPOINT [\"/usr/bin/bash\", \"/rpxy/entrypoint.sh\"] (correctly formatted, takes precedence)"
+    ],
+    "remediation": "Remove the malformed CMD line entirely (line 73), or replace it with 'CMD []' to provide no default arguments to the entrypoint. If default arguments are needed, fix the syntax: CMD [\"/usr/bin/bash\", \"/rpxy/entrypoint.sh\"] and remove the redundant ENTRYPOINT."
+  },
+  {
+    "severity": "medium",
+    "location": ".build/Jenkinsfile:23,101,156",
+    "title": "Jenkinsfile uses unpinned container images for build pipeline with no integrity verification",
+    "description": "The Jenkins pipeline defines three Kubernetes pod containers using mutable image tags: rust:slim, rockylinux:9, and debian:stable-slim. These tags can be updated at any time by the image publishers, and the Jenkinsfile performs no digest verification. The pipeline builds the rpxy binary, RPM package, and DEB package from these containers—any compromise of the base images would affect all distributed packages.",
+    "impact": "If any of the three base images are compromised (via Docker Hub account takeover, registry compromise, or tag mutation), the Jenkins build pipeline would: (a) compile rpxy with a potentially backdoored Rust toolchain (rust:slim), (b) package a compromised binary into RPM packages (rockylinux:9), or (c) package a compromised binary into DEB packages (debian:stable-slim). Since these are system packages installed with root privileges on target systems, the impact of a supply chain compromise through this vector is critical.",
+    "attack_path": "1. Attacker compromises Docker Hub account for rust-lang/rust or library/debian\n2. Malicious image is pushed with the same tag (rust:slim, debian:stable-slim)\n3. Jenkins pipeline runs, Kubernetes pulls the compromised image\n4. Build stage: backdoored rustc compiles malicious rpxy binary\n5. DEB/RPM stages: package the backdoored binary\n6. Packages are archived as Jenkins artifacts and distributed\n7. Users install compromised rpxy as a system service running with CAP_NET_BIND_SERVICE",
+    "evidence": [
+      ".build/Jenkinsfile:23 - image: rust:slim (mutable tag, no digest)",
+      ".build/Jenkinsfile:101 - image: rockylinux:9 (mutable tag, no digest)",
+      ".build/Jenkinsfile:156 - image: debian:stable-slim (mutable tag, no digest)",
+      ".build/Jenkinsfile:60 - cargo build --release (binary compiled in unpinned container)",
+      ".build/Jenkinsfile:86 - archiveArtifacts (compiled binary distributed without verification)"
+    ],
+    "remediation": "Pin all container images to specific digests: 'rust:1.79-slim@sha256:<digest>', 'rockylinux:9@sha256:<digest>', 'debian:12-slim@sha256:<digest>'. Add checksum verification of the compiled binary. Sign Jenkins artifacts. Consider using a private container registry with image scanning and admission control."
   }
 ]
