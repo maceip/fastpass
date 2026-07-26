@@ -1,0 +1,96 @@
+[
+  {
+    "severity": "high",
+    "location": "rpxy-lib/src/proxy/proxy_main.rs:256-262",
+    "title": "ACME TLS-ALPN challenge connections served after shutdown, enabling request processing on unauthenticated streams",
+    "description": "After an ACME TLS-ALPN challenge completes, the code shuts down the TLS stream (line 260) but does NOT return or skip the call to serve_connection() on line 262. The connection proceeds to be served as a normal proxied request on an already-shutdown stream. Because the TLS handshake used the ACME challenge ServerConfig (which uses self-signed, ephemeral ACME challenge certificates rather than the server's real certificate), this means any request sent before the TCP FIN arrives will be processed through the message handler with a server_name derived from the SNI of the ACME challenge connection—bypassing the normal TLS certificate validation flow.",
+    "impact": "An attacker could craft a connection that mimics an ACME TLS-ALPN challenge (ALPN protocol 'acme-tls/1') and, if timing permits, inject HTTP requests that get processed as if they came from a legitimately authenticated TLS session. The shutdown() call is non-blocking and best-effort (.ok()), so there's a race window. Even without exploitation, this is a resource waste as broken streams are passed to the HTTP handler.",
+    "attack_path": "1. Attacker connects to the HTTPS port with SNI for a domain that has ACME configured. 2. Attacker sends ClientHello with ALPN 'acme-tls/1', passing the is_tls_alpn_challenge() check. 3. TLS handshake completes using the ACME challenge ServerConfig. 4. Code calls stream.inner_mut().shutdown().await.ok() but does NOT return. 5. serve_connection() is called with the stream and the SNI-derived server_name. 6. If the attacker sends data before the TCP RST/FIN, the request is processed by the message handler.",
+    "evidence": [
+      "rpxy-lib/src/proxy/proxy_main.rs:256-262 - Missing return/else after ACME shutdown branch"
+    ],
+    "remediation": "Add a `return;` after the `stream.inner_mut().shutdown().await.ok();` call, or restructure the ACME branch to skip serve_connection() when is_handshake_acme is true. Example: change `if is_handshake_acme { ... }` to `if is_handshake_acme { ... return; }` or use `if !is_handshake_acme { self_inner.serve_connection(...); }`."
+  },
+  {
+    "severity": "high",
+    "location": "rpxy-certs/src/certs.rs:45-56",
+    "title": "Private key material exported as plain Vec<u8> via public API without zeroization",
+    "description": "The method cert_keys_bytes() on SingleServerCertsKeys is declared `pub` and copies raw DER-encoded private key bytes into plain Vec<u8> objects. These Vec<u8> buffers are never zeroized before deallocation. The underlying PrivateKeyDer types from rustls use ZeroizeOnDrop for their internal storage, but once the bytes are copied out via secret_pkcs1_der().to_owned() / secret_sec1_der().to_owned() / secret_pkcs8_der().to_owned(), the new Vec<u8> loses all zeroization guarantees. Additionally, SingleServerCertsKeys derives Clone, meaning private key material can be freely duplicated into additional non-zeroized memory locations.",
+    "impact": "Private key material persists in freed memory indefinitely. If the process memory is ever readable (core dump, /proc/pid/mem, swap file, memory forensics, or a separate memory-disclosure vulnerability), TLS private keys can be recovered. This violates cryptographic best practices (NIST SP 800-57, FIPS 140-2) for key material handling.",
+    "attack_path": "1. Private keys are loaded via crypto_source.rs read_certs_and_keys(). 2. Keys are stored in SingleServerCertsKeys which derives Clone and is freely copyable. 3. cert_keys_bytes() (pub method) copies raw key DER bytes into Vec<u8>. 4. When these Vec<u8> or cloned SingleServerCertsKeys instances go out of scope, memory is freed but not zeroed. 5. Key material remains in process heap until overwritten by chance. 6. A separate vulnerability or crash dump exposes the key material.",
+    "evidence": [
+      "rpxy-certs/src/certs.rs:19 - #[derive(Debug, PartialEq, Eq, Clone)] on SingleServerCertsKeys containing private keys",
+      "rpxy-certs/src/certs.rs:45-56 - pub fn cert_keys_bytes() copies secret key bytes to Vec<u8>",
+      "rpxy-certs/src/certs.rs:22 - cert_keys: Arc<Vec<PrivateKey>> field",
+      "rpxy-certs/src/crypto_source.rs:98-133 - encoded_keys Vec<u8> holds PEM-encoded private key in plain memory, never zeroized"
+    ],
+    "remediation": "1. Remove the pub visibility from cert_keys_bytes() or eliminate it entirely (it has no callers). 2. Use zeroize::Zeroizing<Vec<u8>> for any temporary buffers that hold private key material (e.g., encoded_keys in crypto_source.rs:99). 3. Consider wrapping PrivateKey storage in Zeroizing<> and removing the Clone derive from SingleServerCertsKeys, or implementing Drop with explicit zeroization. 4. Remove the Debug derive from SingleServerCertsKeys to prevent accidental logging of key material."
+  },
+  {
+    "severity": "medium",
+    "location": "rpxy-lib/Cargo.toml:78, rpxy-certs/src/server_crypto.rs:75-89",
+    "title": "TLS 0-RTT early data feature enabled without replay protection",
+    "description": "The tokio-rustls dependency is configured with the 'early-data' feature enabled (rpxy-lib/Cargo.toml:78). This feature enables TLS 1.3 0-RTT early data support. While rustls's ServerConfig does not accept early data by default (max_early_data_size defaults to 0), the feature being enabled in a reverse proxy context is risky: if the default ever changes or if a future code change sets max_early_data_size > 0, 0-RTT data would be accepted without any replay protection middleware. The proxy forwards requests to backends, making 0-RTT replay attacks (where an attacker replays captured early data to duplicate requests like financial transactions) a severe concern for a reverse proxy.",
+    "impact": "If 0-RTT is ever activated (either by a rustls default change or explicit configuration), attackers could capture and replay the first flight of TLS data, causing duplicate processing of non-idempotent requests (POST, PUT, DELETE) at backend servers. This is particularly dangerous for a reverse proxy since it would transparently forward replayed requests to backends that have no knowledge of the replay.",
+    "attack_path": "1. early-data feature is compiled in via Cargo.toml. 2. A configuration change or library update enables max_early_data_size > 0. 3. Client sends 0-RTT data with a POST request (e.g., payment). 4. Attacker captures the 0-RTT data from the network. 5. Attacker replays the captured 0-RTT flight to the proxy. 6. Proxy accepts and forwards both original and replayed requests to the backend.",
+    "evidence": [
+      "rpxy-lib/Cargo.toml:78 - tokio-rustls = { version = \"0.26.0\", features = [\"early-data\"] }",
+      "rpxy-certs/src/server_crypto.rs:75-89 - ServerConfig built without explicit max_early_data_size(0) safeguard"
+    ],
+    "remediation": "1. Remove the 'early-data' feature from the tokio-rustls dependency unless 0-RTT is explicitly needed: `tokio-rustls = { version = \"0.26.0\" }`. 2. If early-data must remain, explicitly set `server_config.max_early_data_size = 0` in all ServerConfig construction paths (server_crypto.rs lines 75 and 143) to prevent accidental enablement. 3. If 0-RTT is intentionally desired, implement replay protection middleware."
+  },
+  {
+    "severity": "medium",
+    "location": "rpxy-lib/src/backend/load_balance/sticky_cookie.rs:111-129",
+    "title": "Sticky load-balancing cookie set without Secure, HttpOnly, or SameSite flags",
+    "description": "The sticky cookie (rpxy_srv_id) used for session-persistent load balancing is emitted as a Set-Cookie header without the Secure, HttpOnly, or SameSite attributes. The TryInto<String> implementation for StickyCookie (lines 114-129) only sets 'expires', 'Max-Age', 'path', and 'domain'. The cookie value is a base64url-encoded SHA-256 hash that reveals which upstream backend server is handling the session, including an index value appended to the upstream URI.",
+    "impact": "Without Secure flag: the cookie is sent over plaintext HTTP, allowing network attackers to steal it and determine backend topology. Without HttpOnly: JavaScript on the page can read the cookie, enabling XSS-based backend mapping/fingerprinting. Without SameSite: the cookie is vulnerable to CSRF-based backend pinning attacks where an attacker forces a victim to a specific backend. The cookie value format (SHA-256 of 'upstream_uri&index=N') leaks backend infrastructure topology to any observer.",
+    "attack_path": "1. User visits the site over HTTP (before redirect) or via mixed content. 2. Network attacker intercepts the rpxy_srv_id cookie (no Secure flag). 3. Attacker decodes cookie to map backend infrastructure (SHA-256 of known upstream URIs can be pre-computed). 4. Alternatively, XSS payload reads document.cookie to extract rpxy_srv_id (no HttpOnly flag). 5. Attacker uses CSRF to force victim's cookie to pin them to a specific backend (no SameSite flag).",
+    "evidence": [
+      "rpxy-lib/src/backend/load_balance/sticky_cookie.rs:125-128 - Cookie format: name=value; expires=...; Max-Age=...; path=...; domain=... (missing Secure, HttpOnly, SameSite)",
+      "rpxy-lib/src/backend/upstream.rs:115-121 - calculate_id_with_index() hashes URI with index, revealing backend topology",
+      "rpxy-lib/src/constants.rs:22 - STICKY_COOKIE_NAME = 'rpxy_srv_id'"
+    ],
+    "remediation": "Add Secure, HttpOnly, and SameSite=Lax (or Strict) flags to the Set-Cookie output. Change the format string in sticky_cookie.rs TryInto<String> to: `format!(\"{}={}; expires={}; Max-Age={}; path={}; domain={}; Secure; HttpOnly; SameSite=Lax\", ...)`"
+  },
+  {
+    "severity": "medium",
+    "location": "rpxy-certs/src/server_crypto.rs:101-106",
+    "title": "mTLS client certificate verification lacks CRL/OCSP revocation checking",
+    "description": "The WebPkiClientVerifier is constructed using builder_with_provider().build() without any CRL (Certificate Revocation List) or OCSP (Online Certificate Status Protocol) configuration. The rustls WebPkiClientVerifier supports CRL checking via .with_crls(), but this is never called. This means that if a client certificate is compromised and revoked by the issuing CA, the reverse proxy will continue to accept it as valid for mTLS authentication.",
+    "impact": "Compromised or revoked client certificates remain accepted for mTLS authentication indefinitely. An attacker who obtains a revoked client certificate (e.g., from a terminated employee's device or a compromised system) can continue to authenticate to the proxy and access backend resources protected by mutual TLS.",
+    "attack_path": "1. Organization issues client certificate to employee/device for mTLS access. 2. Certificate is compromised (device stolen, key leaked). 3. Organization revokes the certificate via their CA's CRL. 4. Attacker presents the revoked certificate to rpxy. 5. rpxy's WebPkiClientVerifier accepts it because no CRL/OCSP checking is configured. 6. Attacker gains authenticated access to backend services.",
+    "evidence": [
+      "rpxy-certs/src/server_crypto.rs:101-106 - WebPkiClientVerifier::builder_with_provider(...).build() without .with_crls()",
+      "No CRL/OCSP-related code anywhere in the codebase (confirmed via grep)"
+    ],
+    "remediation": "Add CRL checking to the WebPkiClientVerifier construction. Accept CRL file paths in the configuration (alongside client_ca_cert_path) and pass them via .with_crls() on the verifier builder. Example: `WebPkiClientVerifier::builder_with_provider(root_store, provider).with_crls(crls).build()`. Consider periodic CRL refresh or OCSP stapling for more timely revocation."
+  },
+  {
+    "severity": "medium",
+    "location": "rpxy-certs/src/crypto_source.rs:96-133",
+    "title": "Private key file contents held in unzeroized heap buffer during parsing",
+    "description": "The read_certs_and_keys() function reads the entire private key PEM file into a Vec<u8> buffer (encoded_keys, line 99-108), then wraps it in a Cursor for parsing. This buffer contains the raw PEM-encoded private key material. When encoded_keys goes out of scope, it is dropped (freed) but the memory is NOT zeroized. The allocator simply marks the memory as available for reuse, leaving the private key bytes intact in the heap. Additionally, the Cursor creates a second reference to this data. The parsed PrivateKeyDer types do use zeroize-on-drop internally, but the original PEM buffer does not.",
+    "impact": "Raw PEM-encoded private key material persists in freed heap memory after parsing completes. This material could be recovered through memory forensics, core dumps, or swap file analysis. In a long-running reverse proxy, this memory may persist for extended periods before being overwritten.",
+    "attack_path": "1. rpxy loads private key from file into Vec<u8> (encoded_keys). 2. Key is parsed into PrivateKeyDer objects. 3. encoded_keys Vec<u8> goes out of scope and is freed without zeroization. 4. PEM-encoded key remains in heap until that memory page is coincidentally overwritten. 5. Attacker with access to process memory (core dump, /proc/pid/mem, swap) recovers the key.",
+    "evidence": [
+      "rpxy-certs/src/crypto_source.rs:98-109 - encoded_keys Vec<u8> holds entire private key file, never zeroized",
+      "rpxy-certs/src/crypto_source.rs:110 - Cursor::new(encoded_keys) wraps the key buffer",
+      "No zeroize dependency in rpxy-certs/Cargo.toml"
+    ],
+    "remediation": "1. Add the `zeroize` crate as a dependency to rpxy-certs. 2. Use `zeroize::Zeroizing<Vec<u8>>` instead of `Vec<u8>` for the encoded_keys buffer: `let mut encoded_keys = Zeroizing::new(vec![]);`. This ensures the buffer is zeroed when dropped. 3. Apply the same treatment to any other temporary buffers that handle key material."
+  },
+  {
+    "severity": "medium",
+    "location": "rpxy-certs/src/certs.rs:19",
+    "title": "SingleServerCertsKeys derives Debug, enabling accidental logging of private key material",
+    "description": "The SingleServerCertsKeys struct, which contains private keys (cert_keys: Arc<Vec<PrivateKey>>), derives the Debug trait. If this struct is ever passed to a debug!(), error!(), or format!(\"{:?}\", ...) call, the private key material will be serialized to the log output. While PrivateKeyDer's Debug impl may redact the actual bytes, the Arc<Vec<PrivateKeyDer>> wrapper may still expose length and type information, and the behavior depends on the specific rustls version's Debug implementation. In security-critical code, private key containers should never implement Debug.",
+    "impact": "If any code path inadvertently logs or formats a SingleServerCertsKeys instance with Debug formatting, private key material or metadata could be written to log files, visible to anyone with log access.",
+    "attack_path": "1. Developer adds debug!() or error!() logging that includes the SingleServerCertsKeys struct. 2. Private key bytes or metadata are serialized to the log. 3. Log files are accessible to operators, log aggregation services, or attackers who gain log access. 4. Private keys are exposed.",
+    "evidence": [
+      "rpxy-certs/src/certs.rs:19 - #[derive(Debug, PartialEq, Eq, Clone)] on struct SingleServerCertsKeys",
+      "rpxy-certs/src/certs.rs:22 - cert_keys: Arc<Vec<PrivateKey>> field containing secret key material"
+    ],
+    "remediation": "Remove the Debug derive from SingleServerCertsKeys and implement a manual Debug that redacts the cert_keys field: `impl fmt::Debug for SingleServerCertsKeys { fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.debug_struct(\"SingleServerCertsKeys\").field(\"certs\", &self.certs.len()).field(\"cert_keys\", &\"[REDACTED]\").field(\"client_ca_certs\", &self.client_ca_certs.as_ref().map(|v| v.len())).finish() } }`"
+  }
+]
